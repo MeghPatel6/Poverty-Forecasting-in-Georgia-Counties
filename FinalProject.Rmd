@@ -1,0 +1,277 @@
+---
+title: "FinalProject"
+author: "Megh"
+date: "2025-04-15"
+output: pdf_document
+---
+
+```{r setup, include=FALSE}
+library(fpp3)
+library(usmap)
+library(urca)
+```
+
+
+1. DATA PREPARATIONS
+
+
+1.1 SAIPE data
+
+```{r}
+raw_saipe <- read.csv("SAIPE.csv")
+saipe <- raw_saipe |> select(Year, FIPS = ID, Name, Population = Poverty.Universe, 
+                             Poverty = Number.in.Poverty)
+saipe <- saipe |> mutate(Population = as.integer(gsub(",", "", Population)), 
+                         Poverty = as.integer(gsub(",", "", Poverty)))
+```
+
+State Name: Georgia
+
+State Abbv. : GA
+
+FIPS Code: 13
+
+```{r}
+saipe$Name[saipe$Name == "De Kalb County"] <- "DeKalb County"
+saipe |> distinct(FIPS) |> count()
+```
+
+There are 159 counties in Georgia.
+
+```{r}
+top_10counties <- saipe |> filter(Year == 2023) |> arrange(desc(Population)) |> 
+  head(n=10)
+top_10counties
+```
+
+The largest county is Fulton County.
+
+```{r}
+map_data <- saipe |> filter(Year == 2023) |> mutate(fips = FIPS)
+plot_usmap(regions = "counties", include = "GA", data = map_data, values = "Population") + 
+  scale_fill_continuous(low = "white", high ="blue", name = "Population (2023)", 
+                        label = scales::comma)  +
+  labs(title = "Counties in Georgia") +
+  theme(legend.position = "right")
+```
+
+```{r}
+top_10names <- top_10counties$Name
+saipe |> filter(Name %in% top_10names) |> ggplot(aes(x = Year, y = Poverty)) + 
+  geom_line() + 
+  facet_wrap(~ Name)
+```
+
+
+1.2 County SNAP Benefits
+
+```{r}
+snap_raw <- read.csv("cntysnap.csv", skip = 5)
+snap_untidy <- snap_raw |> filter(State.FIPS.code == 13, County.FIPS.code != 0) |> 
+  mutate(FIPS = as.integer(State.FIPS.code*1000 + County.FIPS.code)) 
+snap <- snap_untidy |> pivot_longer(cols = starts_with("Jul"), names_to = "MonthYear", 
+                                    values_to = "SNAP_Benefit") |>
+  mutate(Name = substr(Name, 1, nchar(Name)-4), 
+         Year = as.integer(substr(MonthYear, 5,8)),
+         SNAP_Benefit = as.integer(gsub(",", "", SNAP_Benefit))) |>
+  select(Name, FIPS, SNAP_Benefit, Year)
+
+snap |> filter(Name %in% top_10names) |> ggplot(aes(x = Year, y = SNAP_Benefit)) + 
+  geom_line() +
+  facet_wrap(~ Name)
+```
+
+
+1.3 State IRS Data
+
+```{r}
+iris_raw <- read.csv("irs.csv", skip = 5)
+iris <- iris_raw |> filter(State.FIPS.code == 13) |> 
+  mutate(Poor_Exemption = as.integer(gsub(",", "", Poor.exemptions))) |>
+  select(Poor_Exemption, Year)
+iris |> ggplot(aes(x = Year, y = Poor_Exemption)) + geom_line()
+```
+
+
+1.4 Merging the data 
+
+```{r}
+data_two <- saipe |> left_join(snap)
+final_data <- data_two |> left_join(iris) |> filter(Year != 2023, Year > 1997)
+#Ignoring the Year 2023 because we don't have SNAP and IRIS data for that year.
+```
+
+```{r}
+final_data |> ggplot(aes(x = log(Population), y = log(Poverty))) + geom_point() + 
+  geom_smooth(method = "lm")
+final_data |> ggplot(aes(x = log(SNAP_Benefit), y = log(Poverty))) + geom_point() +
+  geom_smooth(method = "lm")
+final_data |> ggplot(aes(x = log(Population), y = log(SNAP_Benefit))) + geom_point()
+```
+
+```{r}
+georgia_data <- final_data |> as_tsibble(index = Year, key = c(FIPS, Name))
+```
+
+
+2. LINEAR MODELS
+
+
+2.1 Variable Selection
+
+```{r}
+models <- georgia_data |> model(model_pop = TSLM(log(Poverty) ~ log(Population)),
+                                model_snap = TSLM(log(Poverty) ~ log(SNAP_Benefit)),
+                                model_pe = TSLM(log(Poverty) ~ log(Poor_Exemption)),
+                                model_pop_snap = TSLM(log(Poverty) ~ log(Population) 
+                                                      + log(SNAP_Benefit)),
+                                model_pop_pe = TSLM(log(Poverty) ~ log(Population) 
+                                                    + log(Poor_Exemption)),
+                                model_snap_pe = TSLM(log(Poverty) ~ log(SNAP_Benefit) 
+                                                     + log(Poor_Exemption)),
+                                model_all = TSLM(log(Poverty) ~ log(Population) 
+                                                 + log(SNAP_Benefit) + log(Poor_Exemption)))
+model_results <- models |> report()
+# To find the best model across all counties, first we find which model performs
+# the best for each county 
+best_models_per_county <- model_results |> group_by(Name) |> 
+  slice_max(order_by = adj_r_squared, n = 1) |> ungroup()
+# Simply count the number of times each model performs best for the counties
+best_model_counts <- best_models_per_county |> count(.model) |> arrange(desc(n))
+best_model_counts
+```
+
+It seems that the best model include two input variables which are Population and SNAP_Benefit.
+
+```{r}
+best_model <- georgia_data |> model(TSLM(log(Poverty) ~ log(Population) + log(SNAP_Benefit)))
+georgia_pred <- best_model |> augment()
+georgia_pred |> filter(Name %in% top_10names) |> ggplot(aes(x = Year, y = Poverty)) + 
+  geom_line() + 
+  geom_line(aes(y = .fitted), color = "Orange") +
+  facet_wrap(~Name, scales = "free_y")
+```
+
+
+2.2 Residual Analysis
+
+```{r}
+georgia_pred |> filter(Name %in% top_10names) |> ggplot(aes(x = Year, y = .innov)) +
+  geom_line() + facet_wrap(~Name)
+```
+
+```{r}
+georgia_pred |> features(.innov, ljung_box, lag=10) |> filter(lb_pvalue < 0.05) |> count()
+```
+
+37 counties residuals are significantly different from white noise 
+
+I think the models does a good job of predicting the number in poverty because there are only 37 counties whose residuals does not look like white noise and have some sort of relation. That means, there are 122 counties, where the model predicts the value of poverty without leaving any information in the residuals.
+
+
+3. STOCHASTIC MODELS
+
+
+3.1 Single County Forecasts
+
+```{r}
+fulton_data <- georgia_data |> filter(Name == "Fulton County")
+fulton_models <- fulton_data |> model(model_naive = NAIVE(log(Poverty)),
+                                      model_mean = MEAN(log(Poverty)),
+                                      model_ses = ETS(log(Poverty) ~ error("A") 
+                                                      + trend("N") + season("N")),
+                                      model_holt = ETS(log(Poverty) ~ error("A") 
+                                                       + trend("A") + season("N")),
+                                      model_holt_damp = ETS(log(Poverty) ~ error("A") 
+                                                            + trend("Ad", phi = 0.9) 
+                                                            + season("N")),
+                                      model_arima = ARIMA(log(Poverty)))
+
+fulton_pred <- fulton_models |> forecast(h = 5)
+autoplot(fulton_pred, fulton_data) + facet_wrap(~ .model)
+```
+
+```{r}
+fulton_models |> accuracy()
+```
+
+It seems that the arima model performs the best when it comes to predicting the Poverty for Fulton County.It has the least RMSE as well as MAE which means that it does a better job than others.
+
+
+3.2 Exponential smoothing model
+
+```{r}
+exp_models <- georgia_data |> model(SES = ETS(log(Poverty) ~ error("A") + trend("N") 
+                                              + season("N")),
+                                    Holt = ETS(log(Poverty) ~ error("A") + trend("A") 
+                                               + season("N")),
+                                    Damped_Holt = ETS(log(Poverty) ~ error("A") 
+                                                      + trend("Ad") + season("N")))
+exp_model_results <- exp_models |> glance()
+best_exp_models_per_county <- exp_model_results |> group_by(Name) |> 
+  slice_min(order_by = AICc, n = 1) |> ungroup()
+best_exp_model_counts <- best_exp_models_per_county |> count(.model) |> arrange(desc(n))
+best_exp_model_counts
+```
+
+The results might be quite surprising as the more complex Holt and Holt Damped models were completely dominated by the performance of the simple exponential smoothing model. The results are completely one sided with SES model performing the best for 157 out of 159 counties. So, it is obvious to select simple exponential smoothing model.
+
+
+3.3 ARIMA Models
+
+```{r arima, cache=TRUE}
+arima_model <- georgia_data |> group_by(Name) |> model(auto_arima = ARIMA(log(Poverty)))
+arima_model <- arima_model |> mutate(ideal_model = as.character(auto_arima))
+arima_model |> group_by(ideal_model) |> count() |> arrange(desc(n))
+```
+
+Arima(1,0,0) with mean dominating in 61 counties but surprisingly Random Walk model which is Arima(0,1,0) is the second best performing model.
+
+
+3.4 Cross-Validation
+
+```{r ideal, cache=TRUE}
+ideal_models <- georgia_data |> stretch_tsibble(.init = 15) |> 
+  model(ideal_arima = ARIMA(log(Poverty) ~ pdq(1,0,0)+1),
+        ideal_ets = ETS(log(Poverty) ~ error("A") + trend("N") + season("N"))) 
+```
+
+```{r}
+ideal_models |> forecast(h = 5) |> accuracy(georgia_data) |> group_by(.model) |>
+  summarise(mean_rmse = mean(RMSE))
+```
+
+From the results of combined RMSE which fits the whole state overall, we can see that ARIMA model which was Arima(1,0,0)~mean is performing better than the ETS/SES model by a significant margin because its mean RMSE is lower than the SES model.
+
+
+4. FORECASTS
+
+```{r forecast, cache=TRUE}
+winning_model <- georgia_data |> model(ARIMA(log(Poverty) ~ pdq(1,0,0)+1))
+winning_pred <- winning_model |> forecast(h=5)
+winning_pred
+```
+
+```{r}
+percent_change <- ((winning_pred |> filter(Year == 2027) |> pull(.mean)) - 
+  (georgia_data |> filter(Year == 2022) |> pull(Poverty)))*100 / (georgia_data |> filter(Year == 2022) |> 
+                                                              pull(Poverty))
+
+latest_georgia_data <- georgia_data |> filter(Year==2022)  |> mutate(percent_change = percent_change)
+latest_georgia_data |> arrange(desc(percent_change))
+```
+
+```{r}
+georgia_data |> filter(Name == "Chattahoochee County") |> autoplot(Poverty)
+```
+
+The top five counties with the highest percentage increase in poverty over the next five years are Chattahoochee County, Macon County, Meriwether County, Mitchell County and Wilkinson County. The ARIMA model predicts that the Chattahoochee County will have 60% increase in the poverty percentage which might be quite surprising and might feel unbelievable. Also, in the recent years the number in poverty is decreasing in the county but the model predicts an increase in almost 60% in poverty. This is because ARIMA(1,0,0)~mean model forces the predictions to move towards the mean of the data. So, for this county, the poverty is decreasing but the mean is above its range in recent years, so the prediction rises.
+
+```{r}
+latest_georgia_data <- latest_georgia_data |> mutate(fips = FIPS)
+plot_usmap(regions = "counties", include = "GA", data = latest_georgia_data, values = "percent_change") + 
+  scale_fill_continuous(low = "white", high ="blue", name = "Percent Population Change( in 5 years)", 
+                        label = scales::comma)  +
+  labs(title = "Counties in Georgia") +
+  theme(legend.position = "right")
+```
